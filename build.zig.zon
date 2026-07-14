@@ -1,0 +1,16 @@
+.{
+    .name = .termtrip,
+    .version = "0.0.0",
+    .fingerprint = 0xe4ec16502ab494f5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .autom = .{ .path = "autom" },
+        .cpk = .{ .path = "cpk" },
+        .glix = .{ .path = "glix" },
+        .matrix = .{ .path = "matrix" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}

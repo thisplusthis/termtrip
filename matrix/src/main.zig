@@ -7,8 +7,10 @@
 const std = @import("std");
 const Io = std.Io;
 
-// Import the module the build script exposes under the name "matrix".
+// Import the module the build script exposes under the name "matrix", plus
+// the shared terminal-handling module every screensaver in this repo uses.
 const matrix = @import("matrix");
+const termkit = @import("termkit");
 
 // How long to pause between frames. 45 ms ≈ 22 frames per second — smooth to
 // the eye without spinning the CPU.
@@ -34,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     // Enter full-screen raw mode. `defer` guarantees the terminal is restored
     // on *every* exit path — normal return, an error, or a caught quit — so the
     // user never ends up staring at a broken shell.
-    var term = try matrix.Terminal.init(io, w);
+    var term = try termkit.Terminal.init(io, w);
     defer term.deinit();
 
     // Seed the generator from the wall-clock time so no two runs look alike.

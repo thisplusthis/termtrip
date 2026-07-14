@@ -9,13 +9,12 @@
 //! rotating-kaleidoscope fold (currently off by default -- see
 //! `kaleido_enabled`).
 //!
-//! Controls: press any key for a little glitch burst, 'q' / Ctrl+C to quit.
+//! Controls: press any key for a little glitch burst, 'q' / Esc / Ctrl+C to quit.
 
 const std = @import("std");
 const Io = std.Io;
 const noise = @import("noise.zig");
-
-const posix = std.posix;
+const termkit = @import("termkit");
 
 // ============================================================================
 // TUNABLES -- the knobs worth turning to change the vibe. Everything below
@@ -392,89 +391,6 @@ const chaos_band_spawn_amp: f64 = 0.06; // glitchiness surges during turbulent m
 // ============================================================================
 // Everything below here is plumbing.
 // ============================================================================
-
-// ---------------------------------------------------------------------------
-// Shared state between the render loop and the input-reading thread.
-// ---------------------------------------------------------------------------
-
-var quit_requested = std.atomic.Value(bool).init(false);
-var burst_requests = std.atomic.Value(u32).init(0);
-
-/// Runs on its own OS thread for the whole program's lifetime, blocked on
-/// `read()` of stdin. `posix.read` here blocks the calling thread only,
-/// so doing this on a background thread is what lets the render loop in
-/// `main` keep animating at a steady frame rate instead of freezing
-/// while waiting for a keypress. Quit keys set `quit_requested`; any
-/// other key increments `burst_requests`; both are `std.atomic.Value`s
-/// so the render loop can read them without a lock.
-fn inputThreadMain() void {
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const n = posix.read(posix.STDIN_FILENO, &byte) catch return;
-        if (n == 0) return;
-        switch (byte[0]) {
-            'q', 'Q', 0x03 => {
-                quit_requested.store(true, .seq_cst);
-                return;
-            },
-            else => {
-                _ = burst_requests.fetchAdd(1, .seq_cst);
-            },
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Terminal setup helpers
-// ---------------------------------------------------------------------------
-
-/// Switches the terminal from the default "cooked"/canonical mode into
-/// raw mode, and returns the original settings so the caller can restore
-/// them on exit. In canonical mode the kernel line-buffers input (it
-/// waits for Enter, handles Ctrl+C itself, echoes what you type, etc);
-/// raw mode disables all of that so every keypress reaches `read()`
-/// immediately and unprocessed, which is what lets `inputThreadMain`
-/// react to a single keystroke instead of a whole line. Implemented via
-/// POSIX `termios` flags (see
-/// https://en.wikipedia.org/wiki/POSIX_terminal_interface).
-fn enableRawMode() !posix.termios {
-    const original = try posix.tcgetattr(posix.STDIN_FILENO);
-    var raw = original;
-
-    raw.iflag.BRKINT = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.INPCK = false;
-    raw.iflag.ISTRIP = false;
-    raw.iflag.IXON = false;
-
-    raw.oflag.OPOST = false;
-
-    raw.lflag.ECHO = false;
-    raw.lflag.ICANON = false;
-    raw.lflag.IEXTEN = false;
-    raw.lflag.ISIG = false;
-
-    raw.cc[@intFromEnum(posix.V.MIN)] = 1;
-    raw.cc[@intFromEnum(posix.V.TIME)] = 0;
-
-    try posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw);
-    return original;
-}
-
-const TermSize = struct { rows: u16, cols: u16 };
-
-/// Asks the kernel for the terminal's current size via the `TIOCGWINSZ`
-/// `ioctl` request (https://en.wikipedia.org/wiki/Ioctl) -- there's no
-/// regular read/write/seek call for "how big is this terminal", so
-/// `ioctl` is the standard escape hatch for this kind of device-specific
-/// query. Falls back to a plausible default (80x24) if the call fails,
-/// e.g. because stdout isn't actually a terminal.
-fn terminalSize() TermSize {
-    var ws: posix.winsize = undefined;
-    const rc = std.c.ioctl(posix.STDOUT_FILENO, @intCast(std.c.T.IOCGWINSZ), &ws);
-    if (rc != 0 or ws.row == 0 or ws.col == 0) return .{ .rows = 24, .cols = 80 };
-    return .{ .rows = ws.row, .cols = ws.col };
-}
 
 // ---------------------------------------------------------------------------
 // Color helpers
@@ -1110,33 +1026,18 @@ fn explosionEffectAt(explosions: *const Explosions, fx: f64, fy: f64) ?Explosion
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
-    const size = terminalSize();
-    const rows = size.rows;
-    const cols = size.cols;
-
-    const frame_ns: u64 = @intFromFloat(1_000_000_000.0 / target_fps);
-
-    const original_termios = try enableRawMode();
-    defer posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, original_termios) catch {};
-
     var stdout_buffer: [1 << 16]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    // ANSI/DEC private-mode escapes (https://en.wikipedia.org/wiki/ANSI_escape_code):
-    // ?1049h switches to the alternate screen buffer (so the user's
-    // previous terminal content is restored on exit instead of being
-    // scrolled away), ?25l hides the cursor, and 2J clears the screen.
-    // The `defer` below reverses both on exit.
-    try out.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J");
-    try out.flush();
-    defer {
-        out.writeAll("\x1b[?25h\x1b[?1049l") catch {};
-        out.flush() catch {};
-    }
+    // Take over the terminal: raw mode, alternate screen, hidden cursor.
+    var term = try termkit.Terminal.init(io, out);
+    defer term.deinit();
 
-    const input_thread = try std.Thread.spawn(.{}, inputThreadMain, .{});
-    input_thread.detach();
+    const rows = term.size.rows;
+    const cols = term.size.cols;
+
+    const frame_ns: u64 = @intFromFloat(1_000_000_000.0 / target_fps);
 
     const seed: u64 = @truncate(@as(u96, @bitCast(Io.Timestamp.now(io, .real).nanoseconds)));
     noise.init(seed);
@@ -1174,7 +1075,18 @@ pub fn main(init: std.process.Init) !void {
     // separation is what keeps their crossfade seamless (see `zoomLayer`).
     const zoom_t_offset = random.float(f64) * zoom_cycle_seconds;
 
-    while (!quit_requested.load(.seq_cst)) {
+    while (true) {
+        // Peek at whatever's arrived on stdin since last frame (non-blocking,
+        // see `termkit.Terminal.init`). 'q' / Ctrl+C quits; any other key is
+        // a glitch-burst request.
+        var key_buf: [32]u8 = undefined;
+        const n = term.poll(&key_buf);
+        var bursts: u32 = 0;
+        for (key_buf[0..n]) |byte| switch (byte) {
+            'q', 'Q', 0x1b, 0x03 => return,
+            else => bursts += 1,
+        };
+
         const now = Io.Timestamp.now(io, .awake);
         const dt_ns = last.durationTo(now).nanoseconds;
         last = now;
@@ -1198,7 +1110,6 @@ pub fn main(init: std.process.Init) !void {
 
         bands.tick();
 
-        const bursts = burst_requests.swap(0, .seq_cst);
         if (glitch_enabled) {
             if (bursts > 0) {
                 flash_frames = burst_flash_frames;

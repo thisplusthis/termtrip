@@ -8,15 +8,30 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // `termkit` is the terminal-takeover code (raw mode, winsize, quit
+    // polling) shared by every screensaver in this repo — see
+    // ../shared/termkit. It's not a published package, just a source
+    // directory, so it's wired in directly as a module rather than through
+    // the package manager.
+    const termkit = b.createModule(.{
+        .root_source_file = b.path("../shared/termkit/src/root.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+
     const exe = b.addExecutable(.{
         .name = "autom",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            // We call libc functions (write/read/ioctl/nanosleep/termios), so
-            // we must link the C library.
+            // termkit talks to the terminal via POSIX (termios) and ioctl,
+            // and this file's `selftest` writes straight to a libc fd, so we
+            // must link the C library.
             .link_libc = true,
+            .imports = &.{
+                .{ .name = "termkit", .module = termkit },
+            },
         }),
     });
 

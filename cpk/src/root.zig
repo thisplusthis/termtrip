@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const termkit = @import("termkit");
 
 /// A simple RGB color: three bytes (0-255) for red, green, and blue. This is
 /// still what we ultimately need, since terminals expect RGB escape codes.
@@ -179,73 +180,6 @@ fn cursorToGridTop(writer: *Io.Writer, height: usize) Io.Writer.Error!void {
     try writer.print("\x1b[{d}F", .{height -| 1});
 }
 
-/// How big the user's terminal currently is, in character cells.
-pub const TerminalSize = struct {
-    columns: usize,
-    rows: usize,
-};
-
-/// Asks the terminal how big it is right now, via the same `ioctl` call a
-/// shell uses to word-wrap its output. Falls back to a conservative 80x24
-/// guess if that fails, e.g. because the output isn't actually a terminal.
-pub fn terminalSize(io: Io) TerminalSize {
-    const fallback: TerminalSize = .{ .columns = 80, .rows = 24 };
-
-    var winsize: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const result = io.operate(.{ .device_io_control = .{
-        .file = .stdout(),
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &winsize,
-    } }) catch return fallback;
-
-    if (result.device_io_control < 0 or winsize.col == 0 or winsize.row == 0) return fallback;
-    return .{ .columns = winsize.col, .rows = winsize.row };
-}
-
-/// Reads keypresses without waiting for Enter and without echoing them back
-/// to the screen -- the "raw mode" every full-screen terminal app runs in.
-const Keyboard = struct {
-    stdin_fd: std.posix.fd_t,
-    original_settings: std.posix.termios,
-
-    /// Switches the terminal into raw mode. Call `restore` (e.g. via
-    /// `defer`) once you're done to give the user's shell its normal
-    /// keyboard behavior back.
-    fn enableRawMode() !Keyboard {
-        const stdin_fd = Io.File.stdin().handle;
-        const original_settings = try std.posix.tcgetattr(stdin_fd);
-
-        var raw_settings = original_settings;
-        raw_settings.lflag.ECHO = false; // Don't print keys as they're typed.
-        raw_settings.lflag.ICANON = false; // Deliver keys immediately, not line-by-line.
-        raw_settings.lflag.ISIG = false; // Let us handle Ctrl+C ourselves, below.
-        // With ICANON off, MIN = 0 and TIME = 0 makes `read` return
-        // immediately with whatever's available -- even nothing -- instead
-        // of waiting around. That's what lets us check for a keypress once
-        // per animation frame without ever stalling it.
-        raw_settings.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-        raw_settings.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        try std.posix.tcsetattr(stdin_fd, .NOW, raw_settings);
-
-        return .{ .stdin_fd = stdin_fd, .original_settings = original_settings };
-    }
-
-    fn restore(keyboard: Keyboard) void {
-        std.posix.tcsetattr(keyboard.stdin_fd, .NOW, keyboard.original_settings) catch {};
-    }
-
-    /// True if 'q' or Ctrl+C has been pressed since the last time this was
-    /// called.
-    fn quitWasPressed(keyboard: Keyboard) bool {
-        var buffer: [8]u8 = undefined;
-        const bytes_read = std.posix.read(keyboard.stdin_fd, &buffer) catch return false;
-        for (buffer[0..bytes_read]) |byte| {
-            if (byte == 'q' or byte == 'Q' or byte == 3) return true; // 3 = Ctrl+C
-        }
-        return false;
-    }
-};
-
 /// Animates the color grid until the user presses 'q' (or Ctrl+C): a `Life`
 /// simulation drives each cell's position along the ROYGBIV spectrum, and
 /// the displayed color only slowly catches up to that target instead of
@@ -253,9 +187,11 @@ const Keyboard = struct {
 /// smeared, bleeding trail rather than a flickery, pixel-by-pixel change.
 ///
 /// `width` and `height` are runtime values (typically the user's whole
-/// terminal, from `terminalSize`), so `allocator` is used to size the grid
-/// of "what's currently on screen" to match.
-pub fn animateColorGrid(writer: *Io.Writer, io: Io, allocator: std.mem.Allocator, width: usize, height: usize) !void {
+/// terminal, from `term.size`), so `allocator` is used to size the grid of
+/// "what's currently on screen" to match. `term` is expected to already be in
+/// raw full-screen mode (see `termkit.Terminal.init`, called by `main`).
+pub fn animateColorGrid(term: *termkit.Terminal, allocator: std.mem.Allocator, width: usize, height: usize) !void {
+    const writer = term.w;
     // How much of each cell's *target* color it adopts each frame. Small
     // values make colors lag behind and bleed into each other as they move;
     // `1.0` would snap instantly, with no smear at all. Kept high so the
@@ -279,26 +215,8 @@ pub fn animateColorGrid(writer: *Io.Writer, io: Io, allocator: std.mem.Allocator
     defer allocator.free(cells);
     for (life.current, cells) |position, *cell| cell.* = colorAt(position);
 
-    // We're about to take over the whole screen, so play nice and give it
-    // back the way we found it, in reverse order of how we set it up.
-    // (Zig runs `defer`s last-registered-first, so `flush` genuinely runs
-    // last, after every other cleanup step below has queued its own output.)
-    defer writer.flush() catch {};
-
-    // Switch to the terminal's "alternate screen" -- a separate blank
-    // canvas that full-screen apps like `vim` or `htop` use, so we don't
-    // scribble over the user's actual shell history.
-    try writer.print("\x1b[?1049h", .{});
-    defer writer.print("\x1b[?1049l", .{}) catch {};
-
-    try writer.print("\x1b[?25l", .{}); // Hide the cursor while we animate.
-    defer writer.print("\x1b[?25h", .{}) catch {};
-
-    const keyboard = try Keyboard.enableRawMode();
-    defer keyboard.restore();
-
     var is_first_frame = true;
-    while (!keyboard.quitWasPressed()) {
+    while (!term.pollQuit()) {
         if (!is_first_frame) try cursorToGridTop(writer, height);
         is_first_frame = false;
 
@@ -323,7 +241,7 @@ pub fn animateColorGrid(writer: *Io.Writer, io: Io, allocator: std.mem.Allocator
         // sitting in the buffer while we sleep.
         try writer.flush();
 
-        try io.sleep(frame_delay, .awake);
+        try term.io.sleep(frame_delay, .awake);
     }
 }
 

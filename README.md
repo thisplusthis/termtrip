@@ -21,9 +21,17 @@ cd glix
 zig build run -Doptimize=ReleaseFast
 ```
 
+Or target one from the repo root without `cd`-ing in:
+
+```bash
+zig build run-glix -Doptimize=ReleaseFast   # build and run just glix
+zig build glix                              # build just glix, into ./zig-out/bin
+zig build                                   # build all four
+```
+
 `ReleaseFast` is recommended for the smoothest animation on all of these.
 
-Every one of them quits on `q`, Esc, or `Ctrl+C`.
+Every one of them quits on `q` (or `Ctrl+C`); most also quit on `Esc`.
 
 ## Requirements
 

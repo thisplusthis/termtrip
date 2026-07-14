@@ -17,35 +17,18 @@
 //!      that move the cursor and set colours.
 //!   3. Carefully restore the terminal when we leave, even if we're killed.
 //!
-//! This build targets Zig 0.16. That version reworked the standard I/O
-//! library heavily, so instead of fighting the churn we lean on libc directly
-//! (see the `extern "c"` declarations below). This is a great chance to learn
-//! how Zig calls C functions: you just declare the function's signature and
-//! link libc, and Zig wires it up to the real symbol at link time.
+//! This build targets Zig 0.16. Raw mode, window-size queries, and quit
+//! detection all go through `termkit`, the terminal-handling module shared by
+//! every screensaver in this repo (see ../shared/termkit) — this file only
+//! deals with the automaton itself and the ANSI colour codes that draw it.
 
 const std = @import("std");
+const Io = std.Io;
+const termkit = @import("termkit");
 
-// `std.c` is Zig's binding layer for the C standard library. Because we build
-// with `link_libc = true`, every `std.c.foo` resolves to the real libc `foo`.
+// `std.c` is Zig's binding layer for the C standard library, needed here only
+// for the two headless debug writes in `selftest` (see below).
 const c = std.c;
-
-// ── Raw C functions we need that std doesn't expose as `pub` on 0.16 ────────
-// Declaring an `extern "c" fn` is how you tell Zig "this function lives in a C
-// library I'm linking against; here is its signature." No body — the linker
-// finds it. We declare these ourselves so the program doesn't depend on which
-// helpers happen to be public in this particular std version.
-//
-// `ioctl` controls devices. We use it with the TIOCGWINSZ request to ask the
-// terminal how many rows and columns it currently has.
-extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
-// `nanosleep` pauses the thread for a precise duration — our frame limiter.
-extern "c" fn nanosleep(req: *const c.timespec, rem: ?*c.timespec) c_int;
-
-// The two file descriptors every Unix process is born with. 0 is standard
-// input (the keyboard), 1 is standard output (the screen). Typing them as
-// `c.fd_t` (an alias for c_int on macOS) keeps the C calls happy.
-const STDIN: c.fd_t = 0;
-const STDOUT: c.fd_t = 1;
 
 // ── Tunable knobs ───────────────────────────────────────────────────────────
 // These `const`s are the whole personality of the screensaver. Change them and
@@ -78,7 +61,7 @@ const THRESHOLD: u32 = 1;
 
 /// Nanoseconds to sleep between frames. 70ms ≈ 14 frames per second — smooth
 /// enough to feel alive, slow enough to sip CPU. (1 ms = 1_000_000 ns.)
-const FRAME_NS: c_long = 70 * 1_000_000;
+const FRAME_NS: u64 = 70 * 1_000_000;
 
 /// Every few seconds we sprinkle a handful of random cells back into the field.
 /// Left alone, a cyclic automaton can settle into a calm rotating steady state;
@@ -86,31 +69,6 @@ const FRAME_NS: c_long = 70 * 1_000_000;
 /// goes stale. Measured in frames.
 const SPRINKLE_EVERY: u64 = 200;
 const SPRINKLE_COUNT: usize = 20;
-
-/// If we can't read the real terminal size (e.g. output isn't a TTY) we fall
-/// back to the classic 80×24.
-const FALLBACK_COLS: u16 = 80;
-const FALLBACK_ROWS: u16 = 24;
-
-// ── ANSI escape sequences ────────────────────────────────────────────────────
-// `\x1b` is the ESC byte (27). Terminals treat `ESC [ … <letter>` as a command
-// rather than text. A quick tour of the ones we use:
-//   ESC[?1049h  switch to the "alternate screen" (like vim/less do) so we
-//               don't clobber the user's scrollback; ?1049l switches back.
-//   ESC[?25l    hide the text cursor;  ESC[?25h shows it again.
-//   ESC[2J      clear the whole screen.
-//   ESC[H       move the cursor to the top-left (home).
-//   ESC[0m      reset all colours/attributes to normal.
-const ENTER_SEQ = "\x1b[?1049h\x1b[?25l\x1b[2J";
-const EXIT_SEQ = "\x1b[0m\x1b[?25h\x1b[?1049l";
-
-// ── Globals used by the signal handler ───────────────────────────────────────
-// A signal handler (for Ctrl-C-style interruptions and `kill`) runs "out of
-// band" — it can fire at almost any moment and it CANNOT take arguments from
-// us. The classic C way to give it the data it needs is a global. We keep the
-// terminal's original settings here so the handler can put things back.
-var g_orig_termios: c.termios = undefined;
-var g_raw_active: bool = false;
 
 /// A tiny RGB colour. `u8` fields (0–255 each) match how terminals expect
 /// 24-bit "truecolor" values.
@@ -393,7 +351,7 @@ const Board = struct {
 
     /// Build one full frame of ANSI output and send it to the terminal in a
     /// single write.
-    fn render(self: *Board) void {
+    fn render(self: *Board, w: *Io.Writer) !void {
         var out = Out{ .buf = self.outbuf };
 
         // Jump to the top-left. We overwrite every cell every frame, so there's
@@ -459,137 +417,31 @@ const Board = struct {
             }
         }
 
-        // Hand the whole frame to the OS at once.
-        _ = c.write(STDOUT, out.buf.ptr, out.len);
+        // Hand the whole frame to the terminal at once.
+        try w.writeAll(out.buf[0..out.len]);
+        try w.flush();
     }
 
     /// Run one tick of the whole simulation: maybe sprinkle, advance, draw.
-    fn tick(self: *Board) void {
+    fn tick(self: *Board, w: *Io.Writer) !void {
         self.frame += 1;
         if (self.frame % SPRINKLE_EVERY == 0) self.sprinkle();
         self.step();
-        self.render();
+        try self.render(w);
     }
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Terminal plumbing.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Ask the terminal for its current size via the TIOCGWINSZ ioctl. Returns the
-/// fallback size if the call fails (e.g. output is a pipe, not a real terminal).
-fn queryTerminalSize() struct { cols: u16, rows: u16 } {
-    var ws: std.posix.winsize = undefined;
-    // `c.T.IOCGWINSZ` is the magic request number for "get window size" on this
-    // platform. ioctl writes the answer into `ws`.
-    const rc = ioctl(STDOUT, @intCast(c.T.IOCGWINSZ), &ws);
-    if (rc != 0 or ws.col == 0 or ws.row == 0) {
-        return .{ .cols = FALLBACK_COLS, .rows = FALLBACK_ROWS };
-    }
-    return .{ .cols = ws.col, .rows = ws.row };
-}
-
-/// Put the terminal into raw mode and remember how it was so we can restore it.
-///
-/// "Raw mode" turns off the terminal's helpful-but-here-unwanted behaviours:
-/// line buffering (we want each key immediately), echoing (we don't want typed
-/// letters splattered over our art), and signal/flow-control key handling.
-fn enableRawMode() void {
-    _ = c.tcgetattr(STDIN, &g_orig_termios); // save the originals
-    var raw = g_orig_termios; // a copy we'll tweak
-
-    // `lflag` groups "local" behaviours. Each field is a bool bit.
-    raw.lflag.ECHO = false; // don't print typed characters
-    raw.lflag.ICANON = false; // read byte-by-byte, don't wait for Enter
-    raw.lflag.ISIG = false; // Ctrl-C/Ctrl-Z arrive as bytes, not signals
-    raw.lflag.IEXTEN = false; // disable Ctrl-V literal-next processing
-
-    // `iflag` groups input translations we also want off.
-    raw.iflag.IXON = false; // disable Ctrl-S / Ctrl-Q flow control
-    raw.iflag.ICRNL = false; // don't rewrite carriage-return to newline
-
-    // The `cc` array holds control parameters. With canonical mode off, VMIN
-    // and VTIME govern how `read` blocks. Both 0 means: return immediately with
-    // whatever bytes are available (possibly none) — i.e. non-blocking input,
-    // exactly what a real-time animation wants.
-    raw.cc[@intFromEnum(c.V.MIN)] = 0;
-    raw.cc[@intFromEnum(c.V.TIME)] = 0;
-
-    // TCSA.FLUSH applies the change now and discards any unread input.
-    _ = c.tcsetattr(STDIN, .FLUSH, &raw);
-    g_raw_active = true;
-}
-
-/// Undo enableRawMode and leave the alternate screen. Safe to call from a
-/// signal handler: it only calls async-signal-safe C functions (tcsetattr,
-/// write) and touches globals.
-fn restoreTerminal() void {
-    if (g_raw_active) {
-        _ = c.tcsetattr(STDIN, .FLUSH, &g_orig_termios);
-        g_raw_active = false;
-    }
-    _ = c.write(STDOUT, EXIT_SEQ, EXIT_SEQ.len);
-}
-
-/// Signal handler for Ctrl-C-style interruptions and `kill`. Because signals
-/// bypass our normal `defer` cleanup, we restore the terminal here too, then
-/// exit immediately. `callconv(.c)` gives it the calling convention the OS
-/// expects for a handler.
-fn onSignal(_: c.SIG) callconv(.c) void {
-    restoreTerminal();
-    c._exit(0);
-}
-
-/// Install `onSignal` for the signals that would otherwise kill us with the
-/// terminal left in raw mode (a wrecked shell prompt). Note: with ISIG off,
-/// keyboard Ctrl-C won't raise SIGINT — but an external `kill` still can, and
-/// closing the terminal raises SIGHUP, so wiring these up is good manners.
-fn installSignalHandlers() void {
-    var act = std.posix.Sigaction{
-        .handler = .{ .handler = onSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-    std.posix.sigaction(std.posix.SIG.HUP, &act, null);
-}
-
-/// Sleep for one frame's worth of nanoseconds.
-fn sleepFrame() void {
-    var ts = c.timespec{ .sec = 0, .nsec = FRAME_NS };
-    _ = nanosleep(&ts, null);
-}
-
-/// Poll the keyboard (non-blocking). Returns true if the user asked to quit:
-/// `q`/`Q`, Esc (0x1b), or Ctrl-C (0x03, which reaches us as a byte since we
-/// disabled ISIG).
-fn wantsQuit() bool {
-    var buf: [32]u8 = undefined;
-    const n = c.read(STDIN, &buf, buf.len);
-    if (n <= 0) return false; // no input this frame
-    var i: usize = 0;
-    while (i < @as(usize, @intCast(n))) : (i += 1) {
-        switch (buf[i]) {
-            'q', 'Q', 0x1b, 0x03 => return true,
-            else => {},
-        }
-    }
-    return false;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Zig 0.16 hands `main` a ready-made bundle of process facilities. We only need
-// the command-line arguments, so we accept the lightweight `Init.Minimal` form.
-// (Older Zig used `std.os.argv`; that's gone now.)
-pub fn main(init: std.process.Init.Minimal) !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
     // A hidden self-test mode: `autom --selftest` runs the automaton headlessly
     // and prints a sanity summary to stderr. Handy for CI / verifying the maths
     // without needing a real terminal.
-    var arg_it = init.args.iterate();
+    var arg_it = init.minimal.args.iterate();
     _ = arg_it.skip(); // argv[0] is our own program name — skip it
     if (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--selftest")) return selftest();
@@ -601,56 +453,57 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (arg_it.next()) |num| {
                 count = std.fmt.parseInt(u64, num, 10) catch 3;
             }
-            return renderFrames(count);
+            return renderFrames(io, count);
         }
     }
 
-    // `page_allocator` hands out whole pages straight from the OS. It's perfect
-    // here: we make just a few big, long-lived allocations.
+    // `page_allocator` hands out whole pages straight from the OS. It's
+    // perfect here: we make just a few big, long-lived allocations, and
+    // explicitly free/reallocate them ourselves on a resize (see the main
+    // loop below) rather than relying on an arena.
     const alloc = std.heap.page_allocator;
 
-    // Seed the RNG. We don't have a simple timestamp API on this std version,
-    // but the address of a stack variable is randomised by the OS (ASLR) on
-    // every run, giving us a different-looking pattern each time. Mixing in a
-    // constant avoids a pathological all-zero seed.
-    var seed_anchor: u8 = 0;
-    const seed: u64 = @intFromPtr(&seed_anchor) ^ 0x9E3779B97F4A7C15;
+    const seed: u64 = @truncate(@as(u96, @bitCast(Io.Timestamp.now(io, .real).nanoseconds)));
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
-    // Set up the terminal. The ORDER matters and the cleanup must be bullet-
-    // proof, so we pair each setup step with a `defer` (runs on the way out, in
-    // reverse order) plus signal handlers for the abrupt-exit cases.
-    installSignalHandlers();
-    enableRawMode();
-    defer restoreTerminal(); // runs when main returns (the normal `q` path)
+    var stdout_buffer: [1 << 16]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const w = &stdout_writer.interface;
 
-    _ = c.write(STDOUT, ENTER_SEQ, ENTER_SEQ.len);
+    // Take over the terminal: raw mode, alternate screen, hidden cursor. Also
+    // installs the signal handlers that guarantee the terminal is restored
+    // even if we're killed — see `termkit.Terminal`.
+    var term = try termkit.Terminal.init(io, w);
+    defer term.deinit();
 
     // Build the board at the terminal's current size.
-    var size = queryTerminalSize();
+    var size = term.size;
     var board = try Board.init(alloc, size.cols, size.rows, rng);
     defer board.deinit();
+
+    const frame_delay = Io.Duration.fromNanoseconds(FRAME_NS);
 
     // ── The main loop ─────────────────────────────────────────────────────
     // Check for quit, handle window resizes, advance+draw, then sleep. Repeat
     // forever. This is the heartbeat of basically every real-time program.
     while (true) {
-        if (wantsQuit()) break;
+        if (term.pollQuit()) break;
 
         // Handle terminal resizes gracefully: re-query the size each frame and,
         // if it changed, rebuild the board to fit. Cheap, and it means dragging
         // the window just reshuffles the art instead of corrupting it.
-        const now = queryTerminalSize();
+        const now = term.querySize();
         if (now.cols != size.cols or now.rows != size.rows) {
             board.deinit();
             board = try Board.init(alloc, now.cols, now.rows, rng);
             size = now;
-            _ = c.write(STDOUT, "\x1b[2J", 4); // clear once after a resize
+            try w.writeAll("\x1b[2J"); // clear once after a resize
+            try w.flush();
         }
 
-        board.tick();
-        sleepFrame();
+        try board.tick(w);
+        io.sleep(frame_delay, .awake) catch break;
     }
     // Falling out of the loop returns from main; the `defer`s above restore the
     // terminal and free memory. Clean exit.
@@ -658,20 +511,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 /// Render a fixed number of frames straight to stdout, then exit. No terminal
 /// takeover — this is the non-interactive path used for testing and stills.
-fn renderFrames(count: u64) !void {
+fn renderFrames(io: Io, count: u64) !void {
     const alloc = std.heap.page_allocator;
-    var seed_anchor: u8 = 0;
-    const seed: u64 = @intFromPtr(&seed_anchor) ^ 0x9E3779B97F4A7C15;
+    const seed: u64 = @truncate(@as(u96, @bitCast(Io.Timestamp.now(io, .real).nanoseconds)));
     var prng = std.Random.DefaultPrng.init(seed);
 
-    const size = queryTerminalSize();
+    var stdout_buffer: [1 << 16]u8 = undefined;
+    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const w = &stdout_writer.interface;
+
+    const size = termkit.Terminal.queryStdoutSize();
     var board = try Board.init(alloc, size.cols, size.rows, prng.random());
     defer board.deinit();
 
     var i: u64 = 0;
-    while (i < count) : (i += 1) board.tick();
+    while (i < count) : (i += 1) try board.tick(w);
     // Leave colours reset so a terminal that saw this output isn't left tinted.
-    _ = c.write(STDOUT, "\x1b[0m\n", 5);
+    try w.writeAll("\x1b[0m\n");
+    try w.flush();
 }
 
 /// Headless correctness check used by `--selftest`. It exercises the exact same

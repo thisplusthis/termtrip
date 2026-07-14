@@ -16,6 +16,17 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    // `termkit` is the terminal-takeover code (raw mode, winsize, quit
+    // polling) shared by every screensaver in this repo — see
+    // ../shared/termkit. It's not a published package, just a source
+    // directory, so it's wired in directly as a module rather than through
+    // the package manager.
+    const termkit = b.createModule(.{
+        .root_source_file = b.path("../shared/termkit/src/root.zig"),
+        .target = target,
+        .link_libc = true,
+    });
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -39,6 +50,13 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // termkit talks to the terminal via POSIX (termios) and ioctl, which
+        // on macOS must go through the system C library. Required for `zig
+        // build test` to link the module.
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "termkit", .module = termkit },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -70,6 +88,7 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
@@ -79,6 +98,7 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "cpk", .module = mod },
+                .{ .name = "termkit", .module = termkit },
             },
         }),
     });

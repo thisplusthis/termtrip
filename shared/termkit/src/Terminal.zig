@@ -5,14 +5,15 @@
 //! file behaves as if it were wrapped in `struct { ... }`. The line
 //!     const Terminal = @This();
 //! gives that anonymous struct a name so we can write `Terminal.init(...)` and
-//! return `Terminal` values. Other files import it with `@import("Terminal.zig")`.
+//! return `Terminal` values. Other files import it with `@import("termkit").Terminal`.
 //!
 //! A "normal" terminal is in *cooked* (a.k.a. canonical) mode: it buffers a
 //! whole line, echoes your keystrokes, and only hands the program the text once
 //! you press Enter. That is great for shells and terrible for an animation. So
 //! we flip the terminal into *raw* mode, take over the whole screen, hide the
 //! cursor — and, crucially, put everything back exactly how we found it when we
-//! are done (see `deinit`).
+//! are done (see `deinit`), whether that's a normal exit or the process being
+//! killed out from under us (see "Signal handling" below).
 
 const std = @import("std");
 const Io = std.Io;
@@ -52,6 +53,55 @@ const leave_sequence = reset_color ++ cursor_show ++ wrap_on ++ alt_screen_off;
 
 /// The width and height of the terminal, measured in character cells.
 pub const Size = struct { cols: u16, rows: u16 };
+
+// ---------------------------------------------------------------------------
+// Signal handling.
+//
+// A signal handler (for Ctrl-\-style interruptions and `kill`) runs "out of
+// band" — it can fire at almost any moment, on top of whatever the program was
+// doing, and it cannot take arguments from us or safely call most functions
+// (only a small "async-signal-safe" set, like raw read/write/exit). The
+// classic C way to give it the data it needs is a module-level global: we
+// stash the one piece of state a restore needs (the original termios) here,
+// plus a flag so the handler does nothing if we're not actually in raw mode
+// (e.g. it fires twice, or before `init` ran).
+//
+// Only one `Terminal` is ever live at a time in these programs, so a single
+// global is enough — there's no instance to route the signal to.
+// ---------------------------------------------------------------------------
+var g_original: posix.termios = undefined;
+var g_in_fd: posix.fd_t = posix.STDIN_FILENO;
+var g_out_fd: posix.fd_t = posix.STDOUT_FILENO;
+var g_active = false;
+
+/// Put the terminal back the way we found it and bail out immediately. Must
+/// stick to async-signal-safe calls only: `tcsetattr` and a raw `write`, no
+/// allocation, no `Io.Writer` (which may be mid-mutation when the signal
+/// lands).
+fn onSignal(_: c.SIG) callconv(.c) void {
+    if (g_active) {
+        posix.tcsetattr(g_in_fd, .FLUSH, g_original) catch {};
+        g_active = false;
+    }
+    _ = c.write(g_out_fd, leave_sequence.ptr, leave_sequence.len);
+    c._exit(0);
+}
+
+/// Install `onSignal` for the signals that would otherwise kill us with the
+/// terminal left in raw mode (a wrecked shell prompt). Keyboard Ctrl-C won't
+/// raise SIGINT once ISIG is off (see `init`) — it arrives as a plain byte for
+/// `pollQuit`/`poll` to see instead — but an external `kill` still can, and
+/// closing the terminal window raises SIGHUP, so these are worth catching.
+fn installSignalHandlers() void {
+    const act = posix.Sigaction{
+        .handler = .{ .handler = onSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &act, null);
+    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.HUP, &act, null);
+}
 
 // ---------------------------------------------------------------------------
 // The struct fields. Each `Terminal` value carries the handful of things it
@@ -103,6 +153,14 @@ pub fn init(io: Io, w: *Io.Writer) !Terminal {
     // discards any unread input first, giving us a clean slate.
     try posix.tcsetattr(in_fd, .FLUSH, raw);
 
+    // Arm the signal handlers before we touch the screen, so even a signal
+    // that lands mid-`init` can still put the keyboard back to normal.
+    g_original = original;
+    g_in_fd = in_fd;
+    g_out_fd = out_fd;
+    g_active = true;
+    installSignalHandlers();
+
     var self: Terminal = .{
         .io = io,
         .w = w,
@@ -123,6 +181,7 @@ pub fn init(io: Io, w: *Io.Writer) !Terminal {
 /// with `catch {}` — there is nothing useful we could do about them here, and
 /// leaving the terminal wrecked would be far worse than a lost escape code.
 pub fn deinit(self: *Terminal) void {
+    g_active = false;
     self.w.writeAll(leave_sequence) catch {};
     self.w.flush() catch {};
     posix.tcsetattr(self.in_fd, .FLUSH, self.original) catch {};
@@ -135,15 +194,30 @@ pub fn querySize(self: *Terminal) Size {
     return winSize(self.out_fd);
 }
 
+/// Same query as `querySize`, but without needing a live `Terminal` (and
+/// without taking over the screen to get one) — for the rare headless path
+/// that wants to know the terminal's size without actually entering raw mode
+/// (e.g. rendering a few frames to a pipe for testing).
+pub fn queryStdoutSize() Size {
+    return winSize(posix.STDOUT_FILENO);
+}
+
+/// Peek at stdin (non-blocking, see `init`) and return however many bytes are
+/// waiting, filling `buf` with them. Returns 0 if none have arrived this
+/// frame, or if the read errors for any reason. Most screensavers only care
+/// about the quit keys and can use `pollQuit` instead; this lower-level form
+/// is for the ones that also react to *other* keys (see `glix`).
+pub fn poll(self: *Terminal, buf: []u8) usize {
+    return posix.read(self.in_fd, buf) catch 0;
+}
+
 /// Peek at stdin and report whether the user asked to quit. Because input is
 /// non-blocking (see `init`), this returns immediately every frame.
 pub fn pollQuit(self: *Terminal) bool {
     var buf: [32]u8 = undefined;
-    // `read` fills `buf` with any waiting bytes and returns how many there were
-    // (possibly zero). If it errors, we simply treat it as "no key this frame".
-    const n = posix.read(self.in_fd, &buf) catch return false;
+    const n = self.poll(&buf);
     for (buf[0..n]) |ch| switch (ch) {
-        'q', 'Q', 3 => return true, // 'q', 'Q', or Ctrl-C (byte 0x03)
+        'q', 'Q', 0x1b, 3 => return true, // 'q', 'Q', Esc, or Ctrl-C (byte 0x03)
         else => {},
     };
     return false;

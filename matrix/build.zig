@@ -16,6 +16,17 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+
+    // `termkit` is the terminal-takeover code (raw mode, winsize, quit
+    // polling) shared by every screensaver in this repo — see
+    // ../shared/termkit. It's not a published package, just a source
+    // directory, so it's wired in directly as a module rather than through
+    // the package manager.
+    const termkit = b.createModule(.{
+        .root_source_file = b.path("../shared/termkit/src/root.zig"),
+        .target = target,
+        .link_libc = true,
+    });
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -86,6 +97,7 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "matrix", .module = mod },
+                .{ .name = "termkit", .module = termkit },
             },
         }),
     });

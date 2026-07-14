@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const cpk = @import("cpk");
+const termkit = @import("termkit");
 
 pub fn main(init: std.process.Init) !void {
     // All I/O (reading/writing files, stdout, etc.) flows through this `Io` instance.
@@ -16,11 +17,14 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout_writer = &stdout_file_writer.interface;
 
+    // Take over the terminal: raw mode, alternate screen, hidden cursor.
+    var term = try termkit.Terminal.init(io, stdout_writer);
+    defer term.deinit();
+
     // Fill the whole terminal window, edge to edge.
-    const size = cpk.terminalSize(io);
-    const width = @max(1, size.columns);
-    const height = @max(1, size.rows);
+    const width = @max(1, term.size.cols);
+    const height = @max(1, term.size.rows);
 
     // Runs until 'q' (or Ctrl+C) is pressed.
-    try cpk.animateColorGrid(stdout_writer, io, allocator, width, height);
+    try cpk.animateColorGrid(&term, allocator, width, height);
 }
